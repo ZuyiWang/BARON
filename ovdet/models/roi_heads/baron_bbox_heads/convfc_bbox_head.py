@@ -10,6 +10,9 @@ from torch import Tensor
 from mmdet.registry import MODELS
 from .bbox_head import BaronBBoxHead
 
+import torch
+from ovdet.models.layers import ImageTextCommunicationTransformerEncoder
+import torch.nn.functional as F
 
 @MODELS.register_module()
 class BaronConvFCBBoxHead(BaronBBoxHead):
@@ -288,3 +291,180 @@ class BaronShared4Conv1FCBBoxHead(BaronConvFCBBoxHead):
             fc_out_channels=fc_out_channels,
             *args,
             **kwargs)
+
+@MODELS.register_module()
+class ITCBaronShared4Conv1FCBBoxHead(BaronConvFCBBoxHead):
+
+    def __init__(self, fc_out_channels: int = 1024, base_cls_ids = None, 
+                 num_proposals: int = 512,
+                 kd_query_num: int = 100,
+                 ItcEncoder=None, *args, **kwargs) -> None:
+        super().__init__(
+            num_shared_convs=4,
+            num_shared_fcs=1,
+            num_cls_convs=0,
+            num_cls_fcs=0,
+            num_reg_convs=0,
+            num_reg_fcs=0,
+            fc_out_channels=fc_out_channels,
+            *args,
+            **kwargs)
+        self.base_cls_ids = torch.tensor(base_cls_ids, device=self.cls_embeddings.device)
+        self.ItcEncoder = ImageTextCommunicationTransformerEncoder(**ItcEncoder)
+        self.num_proposals = num_proposals
+
+        self.kd_query_num = kd_query_num
+        if self.kd_query_num:
+            self.kd_query_embedding = nn.Linear(kd_query_num, self.cls_embeddings.shape[1])
+            self.init_cfg += [
+                dict(
+                    type='Xavier', distribution='uniform',
+                    override=dict(name='kd_query_embedding')),
+            ]
+    
+    ###### copy from BaronConvFCBBoxHead ######
+    def forward(self, x: Tuple[Tensor], clip_model=None) -> tuple:
+        """Forward features from the upstream network.
+
+        Args:
+            x (tuple[Tensor]): Features from the upstream network, each is
+                a 4D-tensor.
+
+        Returns:
+            tuple: A tuple of classification scores and bbox prediction.
+
+                - cls_score (Tensor): Classification scores for all \
+                    scale levels, each is a 4D-tensor, the channels number \
+                    is num_base_priors * num_classes.
+                - bbox_pred (Tensor): Box energies / deltas for all \
+                    scale levels, each is a 4D-tensor, the channels number \
+                    is num_base_priors * 4.
+        """
+        # shared part
+        if self.num_shared_convs > 0:
+            for conv in self.shared_convs:
+                x = conv(x)
+
+        if self.num_shared_fcs > 0:
+            if self.with_avg_pool:
+                x = self.avg_pool(x)
+
+            x = x.flatten(1)
+
+            for fc in self.shared_fcs:
+                x = self.relu(fc(x))
+        # separate branches
+        x_cls = x
+        x_reg = x
+
+        for conv in self.cls_convs:
+            x_cls = conv(x_cls)
+        if x_cls.dim() > 2:
+            if self.with_avg_pool:
+                x_cls = self.avg_pool(x_cls)
+            x_cls = x_cls.flatten(1)
+        for fc in self.cls_fcs:
+            x_cls = self.relu(fc(x_cls))
+
+        for conv in self.reg_convs:
+            x_reg = conv(x_reg)
+        if x_reg.dim() > 2:
+            if self.with_avg_pool:
+                x_reg = self.avg_pool(x_reg)
+            x_reg = x_reg.flatten(1)
+        for fc in self.reg_fcs:
+            x_reg = self.relu(fc(x_reg))
+
+        if self.training:
+            text_embedding = self.cls_embeddings[self.base_cls_ids==1]
+            bs = x_cls.shape[0] // self.num_proposals
+            x_cls = self.ItcEncoder(
+                image_query = x_cls.reshape(-1, self.num_proposals, self.word_dim),
+                text_query = text_embedding[None].repeat(bs, 1, 1), 
+                image_query_pos = None,
+                text_query_pos = None,
+            )
+        else:
+            text_embedding = self.cls_embeddings
+            x_cls = self.ItcEncoder(
+                image_query = x_cls[None],
+                text_query = text_embedding[None], 
+                image_query_pos = None,
+                text_query_pos = None,
+            )
+        
+        pseudo_words = self.fc_cls(x_cls.reshape(-1, self.word_dim)).view(-1, self.num_words, self.word_dim)
+        cls_score = self.pred_cls_logits(pseudo_words, clip_model)
+        bbox_pred = self.fc_reg(x_reg) if self.with_reg else None
+        return cls_score, bbox_pred
+    
+    ###### copy from BaronConvFCBBoxHead ######
+    def vision_to_language(self, x):
+        # shared part
+        if self.num_shared_convs > 0:
+            for conv in self.shared_convs:
+                x = conv(x)
+
+        if self.num_shared_fcs > 0:
+            if self.with_avg_pool:
+                x = self.avg_pool(x)
+
+            x = x.flatten(1)
+
+            for fc in self.shared_fcs:
+                x = self.relu(fc(x))
+        # separate branches
+        x_cls = x
+        for conv in self.cls_convs:
+            x_cls = conv(x_cls)
+        if x_cls.dim() > 2:
+            if self.with_avg_pool:
+                x_cls = self.avg_pool(x_cls)
+            x_cls = x_cls.flatten(1)
+        for fc in self.cls_fcs:
+            x_cls = self.relu(fc(x_cls))
+
+        # text_embedding = self.cls_embeddings[self.base_cls_ids==1]
+
+        # input_ones = x_cls.new_ones(self.kd_query_num, self.kd_query_num)
+        # query_embedding = self.kd_query_embedding(input_ones)
+        # query_embedding = F.normalize(query_embedding, p=2, dim=-1)   # normalize
+        # input_query = torch.cat([text_embedding, query_embedding])
+
+        # learn_w = torch.rand(100, 48).softmax(dim=1)
+        # learn_em = learn_w @ text_embedding
+        # all_em = torch.cat([self.cls_embeddings, learn_em])
+        # all_label = torch.cat([self.base_cls_ids, torch.ones(100)*2])   
+        # visualization_embedding(self.cls_embeddings, self.base_cls_ids)
+
+        x_cls = self.ItcEncoder(
+            image_query = x_cls[None],
+            text_query = self.cls_embeddings[None], 
+            image_query_pos = None,
+            text_query_pos = None,
+        )
+        pseudo_words = self.fc_cls(x_cls.reshape(-1, self.word_dim)).view(-1, self.num_words, self.word_dim)
+
+        return pseudo_words
+
+def visualization_embedding(data, labels):
+    import numpy as np
+    from sklearn.manifold import TSNE
+    import matplotlib.pyplot as plt
+
+    data = data.numpy()
+    labels = labels.numpy()
+    # 使用 t-SNE 进行降维
+    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
+    data_2d = tsne.fit_transform(data)
+
+    for label in np.unique(labels):
+        indices = labels == label
+        plt.scatter(data_2d[indices, 0], data_2d[indices, 1], label=f'Class {label}')
+
+    plt.title("t-SNE Visualization of 80 512-D Vectors with Labels")
+    plt.xlabel("t-SNE Dimension 1")
+    plt.ylabel("t-SNE Dimension 2")
+    plt.legend(title="Classes")  # 显示类别标签的图例
+    plt.savefig("tsne_visualization_with_labels.png", format='png', dpi=300)
+    plt.close()
