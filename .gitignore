@@ -134,4 +134,4 @@ data/lvis_v1
 model/
 work_dirs/
 checkpoints/
-pretrained_checkpoints/
+pretrained_checkpoints
